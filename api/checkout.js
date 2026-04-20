@@ -52,10 +52,19 @@ export default async function handler(req, res) {
     }
 
     const orderId = order.id;
-    const BASE = process.env.PUBLIC_SITE_URL || 'https://kroc-granola.vercel.app';
+
+    // Detecta domínio automaticamente: host da request > env var > fallback
+    // Assim: preview chama preview, prod chama prod, sem risco de cruzar
+    const hostFromReq = req.headers['x-forwarded-host'] || req.headers.host || '';
+    const protoFromReq = req.headers['x-forwarded-proto'] || 'https';
+    const BASE = hostFromReq
+      ? `${protoFromReq}://${hostFromReq}`
+      : (process.env.PUBLIC_SITE_URL || 'https://kroc-granola.vercel.app');
     const WEBHOOK_SECRET = process.env.INFINITEPAY_WEBHOOK_SECRET;
     const webhookUrl = `${BASE}/api/webhook?secret=${encodeURIComponent(WEBHOOK_SECRET)}`;
     const redirectUrl = `${BASE}/obrigado?order_id=${orderId}`;
+
+    console.log('[checkout] base URL:', BASE, 'orderId:', orderId);
 
     // 2) Formata items pra InfinitiPay (preços em centavos)
     //    Consolida em 1 item se tiver cupom (workaround pro bug de validação de catálogo)
@@ -86,6 +95,20 @@ export default async function handler(req, res) {
       },
       items: ipItems,
     };
+
+    // Adiciona endereço se disponível — InfinitiPay aceita como opcional
+    if (customer_address && typeof customer_address === 'object') {
+      const addr = customer_address;
+      payload.address = {
+        cep: String(addr.cep || '').replace(/\D/g, ''),
+        street: addr.street || '',
+        number: String(addr.number || ''),
+        complement: addr.complement || '',
+        neighborhood: addr.neighborhood || '',
+        city: addr.city || 'São Paulo',
+        state: addr.state || 'SP',
+      };
+    }
 
     const ipRes = await fetch('https://api.infinitepay.io/invoices/public/checkout/links', {
       method: 'POST',
