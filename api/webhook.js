@@ -1,5 +1,6 @@
 // Recebe webhook da InfinitiPay quando pagamento é confirmado
 // Valida autenticidade (secret + payment_check), marca order como paid, dispara notificações
+// IMPORTANTE: notifica ANTES de responder 200 — Vercel encerra a função assim que res.send() é chamado
 import { supabaseAdmin } from '../lib/supabase.js';
 import { fireAllNotifications } from '../lib/notifications.js';
 
@@ -49,7 +50,6 @@ export default async function handler(req, res) {
   }
   if (evErr) {
     console.error('[webhook] db error', evErr);
-    // 400 → InfinitiPay retenta
     return res.status(400).json({ success: false, message: 'db error' });
   }
 
@@ -85,6 +85,8 @@ export default async function handler(req, res) {
     paidConfirmed = checkData?.success === true && checkData?.paid === true;
     if (!paidConfirmed) {
       console.warn('[webhook] payment_check says not paid:', checkData);
+    } else {
+      console.log('[webhook] payment_check confirmed paid');
     }
   } catch (e) {
     console.warn('[webhook] payment_check network fail, trusting secret:', e.message);
@@ -105,7 +107,7 @@ export default async function handler(req, res) {
 
   // 5) Promove pending → paid (guard: só se ainda for pending)
   if (order.status !== 'paid') {
-    await supabaseAdmin
+    const { error: updErr } = await supabaseAdmin
       .from('orders')
       .update({
         status: 'paid',
@@ -116,38 +118,49 @@ export default async function handler(req, res) {
       })
       .eq('id', orderId)
       .eq('status', 'pending');
+    if (updErr) console.error('[webhook] order update err:', updErr);
+    else console.log('[webhook] order promoted to paid:', orderId);
   }
 
-  // 6) Responde 200 rápido (InfinitiPay exige <1s)
-  res.status(200).json({ success: true, message: null });
+  // 6) Busca pedido atualizado
+  const { data: fresh } = await supabaseAdmin
+    .from('orders')
+    .select('*')
+    .eq('id', orderId)
+    .single();
 
-  // 7) Notificações em background
-  try {
-    const { data: fresh } = await supabaseAdmin
-      .from('orders')
-      .select('*')
-      .eq('id', orderId)
-      .single();
-
-    if (fresh && fresh.status === 'paid' && !fresh.notifications_sent) {
-      const anyOk = await fireAllNotifications(fresh);
-      if (anyOk) {
+  // 7) Notificações — AGORA, ANTES do res.send (crucial: Vercel encerra a função após send)
+  let notifOk = false;
+  if (fresh && fresh.status === 'paid' && !fresh.notifications_sent) {
+    console.log('[webhook] firing notifications for', orderId);
+    try {
+      notifOk = await fireAllNotifications(fresh);
+      if (notifOk) {
         await supabaseAdmin
           .from('orders')
           .update({ notifications_sent: true })
           .eq('id', orderId);
+        console.log('[webhook] notifications_sent=true saved');
+      } else {
+        console.error('[webhook] ALL notifications failed');
       }
+    } catch (e) {
+      console.error('[webhook] notif fatal:', e);
     }
-
-    await supabaseAdmin
-      .from('webhook_events')
-      .update({ processed: true, processed_at: new Date().toISOString() })
-      .eq('event_id', eventId);
-  } catch (e) {
-    console.error('[webhook] bg notif error', e);
-    await supabaseAdmin
-      .from('webhook_events')
-      .update({ processed: false, error: String(e?.message || e) })
-      .eq('event_id', eventId);
+  } else {
+    console.log('[webhook] skipping notifications — status:', fresh?.status, 'sent:', fresh?.notifications_sent);
   }
+
+  // 8) Marca evento como processado
+  await supabaseAdmin
+    .from('webhook_events')
+    .update({
+      processed: true,
+      processed_at: new Date().toISOString(),
+      error: notifOk ? null : 'notifications_failed_or_partial',
+    })
+    .eq('event_id', eventId);
+
+  // 9) Agora sim responde 200
+  return res.status(200).json({ success: true, message: null });
 }
