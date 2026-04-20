@@ -104,7 +104,16 @@ export default async function handler(req, res) {
     }
 
     const checkoutUrl = ipData.url || ipData.checkout_url || ipData.link;
-    const checkoutId = ipData.slug || ipData.invoice_slug || ipData.id || null;
+    // Extrai id/slug: tenta campos diretos primeiro, depois extrai do URL (parâmetro lenc=)
+    let checkoutId = ipData.slug || ipData.invoice_slug || ipData.id || null;
+    if (!checkoutId && checkoutUrl) {
+      try {
+        const u = new URL(checkoutUrl);
+        checkoutId = u.searchParams.get('lenc') || u.pathname.split('/').pop() || null;
+      } catch {}
+    }
+
+    console.log('[checkout] InfinitiPay response:', { checkoutId: checkoutId?.slice(0, 30), checkoutUrl: checkoutUrl?.slice(0, 60) });
 
     await supabaseAdmin
       .from('orders')

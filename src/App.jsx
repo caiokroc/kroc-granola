@@ -270,125 +270,113 @@ export default function App(){
   };
   const removeCoupon=()=>{setCoupon("");setCouponDisc(0);setCouponCode("");setCouponMsg("");setCouponEscopo("pedido");};
 
-  // If customer returns from InfinitiPay, show success page
+  // ═════════════════════════════════════════════════════════════
+  // FLUXO NOVO: pedido pending até webhook confirmar pagamento
+  // ═════════════════════════════════════════════════════════════
+
+  // Se retornou da InfinitiPay, mostra tela de "aguardando confirmação"
+  // com polling no /api/order-status. Notificações são disparadas pelo
+  // webhook /api/webhook quando pagamento é confirmado — NÃO aqui.
   useEffect(()=>{
     var params=new URLSearchParams(window.location.search);
-    if(params.get("payment")==="success"){
-      try{
-        var saved=JSON.parse(localStorage.getItem("kroc_order"));
-        if(saved&&!saved.notified){
-          // Backup: send notifications if they weren't sent before
-          var orderData={...saved,notified:true};
-          localStorage.setItem("kroc_order",JSON.stringify(orderData));
-          sendEmailData(saved);
-          sendToSheets(saved);
-          sendToSupabase(saved);
-          sendWhatsApp(saved);
-        }
-        localStorage.removeItem("kroc_order");
-      }catch(e){}
+    var oid=params.get("order_id");
+    if(oid){
+      setStep("awaiting_payment");
+      setPollingOrderId(oid);
+    }
+    // Free order (cupom 100%)
+    if(params.get("payment")==="success"&&params.get("free")==="1"){
       setStep("paid");
       window.history.replaceState({},"",window.location.pathname);
     }
   },[]);
 
+  // Polling: verifica a cada 3s se o pedido foi pago
+  const[pollingOrderId,setPollingOrderId]=useState(null);
+  const[pollingStatus,setPollingStatus]=useState("pending");
+  const[pollingTimedOut,setPollingTimedOut]=useState(false);
+  useEffect(()=>{
+    if(!pollingOrderId)return;
+    var start=Date.now();
+    var MAX=3*60*1000; // 3 minutos
+    var cancelled=false;
+    var iv=setInterval(async function(){
+      if(cancelled)return;
+      try{
+        var r=await fetch("/api/order-status?id="+pollingOrderId);
+        var d=await r.json();
+        if(d.status&&d.status!=="pending"){
+          setPollingStatus(d.status);
+          if(d.status==="paid"){setStep("paid");}
+          clearInterval(iv);return;
+        }
+      }catch(e){console.warn("[poll] fail:",e);}
+      if(Date.now()-start>=MAX){setPollingTimedOut(true);clearInterval(iv);}
+    },3000);
+    return function(){cancelled=true;clearInterval(iv);};
+  },[pollingOrderId]);
+
   const checkout=async()=>{
     setSending(true);setCheckErr("");
-    // Re-carrega flags do Supabase antes de processar — garante que pausas recentes tenham efeito
-    try{
-      var fr=await fetch(SUPA_URL+"/rest/v1/feature_flags?select=key,enabled",{headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY}});
-      var frows=await fr.json();
-      var fm={};(frows||[]).forEach(function(f){fm[f.key]=f.enabled;});
-      setFlags(fm);
-      var flagsNow=fm;
-      window.__kroc_flags=flagsNow;
-      console.log("%c[Flags] 🚩 CARREGADAS PRÉ-CHECKOUT","color:#059669;font-weight:bold;font-size:14px",flagsNow);
-      // Destaque especial se algo está pausado
-      Object.keys(flagsNow).forEach(k=>{
-        if(flagsNow[k]===false)console.log(`%c[Flags] ⏸️ PAUSADO: ${k}`,"color:#DC2626;font-weight:bold");
-      });
-    }catch(e){console.error("[Flags] ❌ falha ao re-carregar:",e);}
-    var orderData={name:capName(f.name),email:(f.email||"").toLowerCase().trim(),phone:f.phone,street:f.street,number:f.number,complement:f.complement,neighborhood:f.neighborhood,city:f.city,state:f.state,cep:f.cep,qty240:qty["240g"]||0,qty500:qty["500g"]||0,frete:ship||0,subtotal:sub,discountPct:couponDisc,discountVal:disc,couponCode:couponCode||"-",totalNum:tot,orderDetails:orderTxt()+(couponCode?"\nCupom: "+couponCode+" (-"+couponDisc+"%)":" ")+"\nFrete: "+fmt(ship||0),total:fmt(tot),date:new Date().toLocaleString("pt-BR"),endereco:f.street+", "+f.number+" - "+f.neighborhood,notified:true};
-    // Send ALL notifications NOW before redirecting
-    await Promise.all([
-      sendEmailData(orderData),
-      sendToSheets(orderData),
-      sendToSupabase(orderData),
-      sendWhatsApp(orderData)
-    ]);
-    // Record coupon usage in Supabase
-    if(couponCode&&couponCode!=="-"){try{
-      await fetch(SUPA_URL+"/rest/v1/cupons_uso",{method:"POST",headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY,"Content-Type":"application/json","Prefer":"return=minimal"},body:JSON.stringify({cupom_code:couponCode,cliente:f.name,desconto_valor:disc})});
-      var cr=await fetch(SUPA_URL+"/rest/v1/cupons?code=eq."+couponCode+"&select=uso_atual",{headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY}});
-      var cd=await cr.json();if(cd&&cd[0]){await fetch(SUPA_URL+"/rest/v1/cupons?code=eq."+couponCode,{method:"PATCH",headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY,"Content-Type":"application/json","Prefer":"return=minimal"},body:JSON.stringify({uso_atual:(cd[0].uso_atual||0)+1})});}
-    }catch(e){console.warn("Cupom uso:",e);}}
-    // Save order marked as notified
-    try{localStorage.setItem("kroc_order",JSON.stringify(orderData));}catch(e){}
 
-    // FAST-PATH: se o total é zero (cupom 100%), não precisa passar pela InfinitiPay
+    // FAST-PATH: pedido gratuito (cupom 100%) pula InfinitiPay
     if(tot<=0){
-      console.log("[Checkout] Pedido gratuito (total=0), pulando InfinitiPay");
+      // Grava pending manualmente pra admin
+      try{
+        await fetch(SUPA_URL+"/rest/v1/orders",{method:"POST",headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY,"Content-Type":"application/json"},body:JSON.stringify({
+          status:"paid",
+          customer_name:capName(f.name),
+          customer_email:(f.email||"").toLowerCase().trim(),
+          customer_phone:f.phone,
+          customer_address:{street:f.street,number:f.number,complement:f.complement,neighborhood:f.neighborhood,city:f.city,state:f.state,cep:f.cep},
+          items:products.filter(function(p){return qty[p.id]>0;}).map(function(p){return{sku:p.id,name:p.name,quantity:qty[p.id],price:p.price};}),
+          qty_40:0,qty_240:qty["240g"]||0,qty_500:qty["500g"]||0,
+          subtotal:sub,frete:ship||0,desconto:disc,total_amount:tot,
+          cupom_code:couponCode||null,cupom_desconto_pct:couponDisc||null,
+          payment_method:"free_coupon",paid_at:new Date().toISOString(),
+        })});
+      }catch(e){console.error("[free] fail:",e);}
       setSending(false);
       window.location.href=window.location.origin+"/?payment=success&free=1";
       return;
     }
 
-    // Build items for InfinitiPay
-    // KEY FIX: When coupon is applied, send ONE line item with the total discounted amount.
-    // This bypasses InfinitiPay's catalog price validation that rejects modified prices.
-    // When NO coupon, send individual items normally (prices match catalog, so validation passes).
-    var items;
-    if(couponDisc>0){
-      // Single line item with total discounted amount — no per-item price validation
-      var totalCents=Math.round(tot*100);
-      var parts=[];
-      products.filter(function(p){return qty[p.id]>0;}).forEach(function(p){parts.push(qty[p.id]+"x "+p.name);});
-      if(ship&&ship>0)parts.push("Frete");
-      var summary=parts.join(" + ");
-      // Describe what the coupon covers
-      var esc=couponEscopo||"";
-      var cobre=[];
-      if(esc==="pedido"||esc==="pedido_frete"||esc.indexOf("240g")>=0||esc.indexOf("500g")>=0)cobre.push("produtos");
-      if(esc==="frete"||esc==="pedido_frete"||esc.indexOf("frete")>=0)cobre.push("frete");
-      var coberturaMsg=cobre.length===2?"":cobre.length===1?" (só "+cobre[0]+")":"";
-      items=[{quantity:1,price:totalCents,description:"Pedido Kroc — "+summary+" (Cupom "+couponCode+" -"+couponDisc+"%"+coberturaMsg+")"}];
-    }else{
-      // No coupon — send items at standard catalog prices
-      items=products.filter(function(p){return qty[p.id]>0;}).map(function(p){return{quantity:qty[p.id],price:Math.round(p.price*100),description:p.name};});
-      if(ship&&ship>0)items.push({quantity:1,price:Math.round(ship*100),description:"Frete"});
-    }
-    var phone=f.phone.replace(/[^0-9]/g,"");
-    var siteUrl=window.location.origin;
-    // EXACT payload format that worked with Google Sheets version
-    var payload={
-      handle:CFG.handle,
-      items:items,
-      customer:{name:f.name,email:f.email,phone_number:"+55"+phone},
-      address:{cep:f.cep.replace(/[^0-9]/g,""),street:f.street,neighborhood:f.neighborhood,number:f.number,complement:f.complement},
-      redirect_url:siteUrl+"/?payment=success",
-      webhook_url:siteUrl+"/api/webhook"
+    // Cria pedido pending no Supabase + gera link da InfinitiPay
+    var orderPayload={
+      customer_name:capName(f.name),
+      customer_email:(f.email||"").toLowerCase().trim(),
+      customer_phone:f.phone,
+      customer_address:{street:f.street,number:f.number,complement:f.complement,neighborhood:f.neighborhood,city:f.city,state:f.state,cep:f.cep},
+      items:products.filter(function(p){return qty[p.id]>0;}).map(function(p){return{sku:p.id,name:p.name,quantity:qty[p.id],price:p.price};}),
+      qty_40:0,qty_240:qty["240g"]||0,qty_500:qty["500g"]||0,
+      subtotal:sub,
+      frete:ship||0,
+      desconto:disc,
+      total_amount:tot,
+      cupom_code:couponCode||null,
+      cupom_desconto_pct:couponDisc||null,
     };
-    console.log("[Checkout] Payload:",JSON.stringify(payload,null,2));
+
     try{
-      var res=await fetch("/api/checkout",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      var res=await fetch("/api/checkout",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(orderPayload)});
       var data=await res.json();
       console.log("[Checkout] Status:",res.status,"Resposta:",data);
-      var link=data&&(data.url||data.checkout_url||data.link||data.payment_url);
-      if(!link&&data&&typeof data==="string"&&data.startsWith("http"))link=data;
-      if(link){window.location.href=link;}
-      else{
-        console.error("[Checkout] API não retornou link. Resposta completa:",data);
-        // Surface specific field errors from InfinitiPay
-        var msg=data&&data.message?data.message:"Erro desconhecido";
-        if(data&&data.errors&&typeof data.errors==="object"){
-          var fields=Object.keys(data.errors);
-          if(fields.length>0){
-            msg+=" ("+fields.map(function(k){var v=data.errors[k];return k+": "+(Array.isArray(v)?v.join(", "):v);}).join("; ")+")";
-          }
-        }
+      if(!res.ok||!data.success||!data.checkout_url){
+        var msg=data&&data.error?data.error:"Erro desconhecido";
+        if(data&&data.details){msg+=" — "+JSON.stringify(data.details).slice(0,200);}
         setCheckErr("Erro: "+msg.slice(0,300));
         setSending(false);
+        return;
       }
+      // Registra uso do cupom (só pra pendente — webhook não faz isso)
+      if(couponCode&&couponCode!=="-"){try{
+        await fetch(SUPA_URL+"/rest/v1/cupons_uso",{method:"POST",headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY,"Content-Type":"application/json","Prefer":"return=minimal"},body:JSON.stringify({cupom_code:couponCode,cliente:f.name,desconto_valor:disc})});
+        var cr=await fetch(SUPA_URL+"/rest/v1/cupons?code=eq."+couponCode+"&select=uso_atual",{headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY}});
+        var cd=await cr.json();
+        if(cd&&cd[0]){await fetch(SUPA_URL+"/rest/v1/cupons?code=eq."+couponCode,{method:"PATCH",headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY,"Content-Type":"application/json","Prefer":"return=minimal"},body:JSON.stringify({uso_atual:(cd[0].uso_atual||0)+1})});}
+      }catch(e){console.warn("Cupom uso:",e);}}
+      // Redireciona para InfinitiPay
+      window.location.href=data.checkout_url;
     }catch(e){
       console.error("[Checkout] Exceção:",e);
       setCheckErr("Erro de conexão: "+e.message);
@@ -525,6 +513,29 @@ export default function App(){
           <button onClick={()=>valid&&!notSP&&checkout()} disabled={!valid||sending||notSP} style={{width:"100%",padding:15,borderRadius:14,border:"none",marginTop:18,background:valid&&!notSP?"linear-gradient(135deg,"+C.olive+","+C.lOlive+")":C.brd,color:valid&&!notSP?"#fff":"#bbb",fontSize:15,fontWeight:700,fontFamily:"'DM Sans',sans-serif",letterSpacing:.8,cursor:valid&&!notSP?"pointer":"not-allowed",textTransform:"uppercase",opacity:sending?.5:1}}>{sending?"Processando...":"Ir para Pagamento"}</button>
           {checkErr&&<p style={{color:"#c44",fontSize:13,marginTop:8,textAlign:"center"}}>{checkErr}</p>}
           <button onClick={()=>setStep("products")} style={{width:"100%",padding:13,borderRadius:14,border:"2px solid "+C.brd,background:"transparent",color:C.mut,fontSize:13,fontWeight:600,fontFamily:"'DM Sans',sans-serif",cursor:"pointer",marginTop:10}}>Voltar aos produtos</button>
+        </div>)}
+
+        {step==="awaiting_payment"&&(<div style={{textAlign:"center",padding:"36px 16px"}}>
+          {pollingStatus==="pending"&&!pollingTimedOut&&(<>
+            <div style={{width:76,height:76,borderRadius:"50%",background:"linear-gradient(135deg,#F5A623,#E8912B)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 18px",fontSize:38,color:"#fff",animation:"pulse 1.5s infinite"}}>⏳</div>
+            <h2 style={{fontFamily:"'Playfair Display',serif",fontSize:23,marginBottom:10}}>Aguardando confirmação…</h2>
+            <p style={{color:C.mut,lineHeight:1.6,marginBottom:22,fontSize:14}}>Seu pagamento está sendo processado. Não feche esta página.</p>
+            <div style={{background:"#FFF8E7",borderRadius:12,padding:16,marginBottom:22,border:"1px solid "+C.lightGold+"40"}}>
+              <p style={{fontSize:13,color:C.mut,margin:0,lineHeight:1.6}}>Assim que o pagamento for confirmado, você verá aqui e receberá um email de confirmação.</p>
+            </div>
+          </>)}
+          {pollingTimedOut&&pollingStatus==="pending"&&(<>
+            <div style={{width:76,height:76,borderRadius:"50%",background:"#F5A623",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 18px",fontSize:38,color:"#fff"}}>⏱</div>
+            <h2 style={{fontFamily:"'Playfair Display',serif",fontSize:23,marginBottom:10}}>Pagamento em processamento</h2>
+            <p style={{color:C.mut,lineHeight:1.6,marginBottom:22,fontSize:14}}>Estamos verificando o pagamento. Você receberá um email quando for confirmado.</p>
+            <a href="https://wa.me/message/HGTONE2IW6R7I1" target="_blank" rel="noopener noreferrer" style={{display:"block",width:"100%",padding:15,borderRadius:14,border:"none",background:"#25D366",color:"#fff",fontSize:15,fontWeight:700,fontFamily:"'DM Sans',sans-serif",textDecoration:"none",textAlign:"center",letterSpacing:.5,boxSizing:"border-box",marginBottom:12}}>Falar no WhatsApp</a>
+          </>)}
+          {(pollingStatus==="failed"||pollingStatus==="expired")&&(<>
+            <div style={{width:76,height:76,borderRadius:"50%",background:"#DC2626",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 18px",fontSize:38,color:"#fff"}}>✕</div>
+            <h2 style={{fontFamily:"'Playfair Display',serif",fontSize:23,marginBottom:10}}>Pagamento não confirmado</h2>
+            <p style={{color:C.mut,lineHeight:1.6,marginBottom:22,fontSize:14}}>Parece que houve um problema com o pagamento. Tente novamente.</p>
+            <button onClick={()=>{setPollingOrderId(null);reset();}} style={{width:"100%",padding:13,borderRadius:14,border:"2px solid "+C.brd,background:"transparent",color:C.mut,fontSize:13,fontWeight:600,fontFamily:"'DM Sans',sans-serif",cursor:"pointer"}}>Tentar novamente</button>
+          </>)}
         </div>)}
 
         {step==="paid"&&(<div style={{textAlign:"center",padding:"36px 16px"}}>
