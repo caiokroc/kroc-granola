@@ -331,7 +331,7 @@ export default function App(){
           customer_address:{street:f.street,number:f.number,complement:f.complement,neighborhood:f.neighborhood,city:f.city,state:f.state,cep:f.cep},
           items:products.filter(function(p){return qty[p.id]>0;}).map(function(p){return{sku:p.id,name:p.name,quantity:qty[p.id],price:p.price};}),
           qty_40:0,qty_240:qty["240g"]||0,qty_500:qty["500g"]||0,
-          subtotal:sub,frete:ship||0,desconto:disc,total_amount:tot,
+          subtotal:sub,frete:Math.max(0,(ship||0)-(discFrete||0)),desconto:disc,total_amount:tot,
           cupom_code:couponCode||null,cupom_desconto_pct:couponDisc||null,
           payment_method:"free_coupon",paid_at:new Date().toISOString(),
         })});
@@ -342,6 +342,8 @@ export default function App(){
     }
 
     // Cria pedido pending no Supabase + gera link da InfinitiPay
+    // IMPORTANTE: frete efetivo já tem discFrete aplicado (cupom de frete grátis)
+    var freteEfetivo=Math.max(0,(ship||0)-(discFrete||0));
     var orderPayload={
       customer_name:capName(f.name),
       customer_email:(f.email||"").toLowerCase().trim(),
@@ -350,7 +352,7 @@ export default function App(){
       items:products.filter(function(p){return qty[p.id]>0;}).map(function(p){return{sku:p.id,name:p.name,quantity:qty[p.id],price:p.price};}),
       qty_40:0,qty_240:qty["240g"]||0,qty_500:qty["500g"]||0,
       subtotal:sub,
-      frete:ship||0,
+      frete:freteEfetivo,
       desconto:disc,
       total_amount:tot,
       cupom_code:couponCode||null,
