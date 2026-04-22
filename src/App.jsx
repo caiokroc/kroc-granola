@@ -9,14 +9,27 @@ const IMG_CAT = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAAAAAAD/4gHYSUNDX1BS
 const CFG = { emailServiceId: "service_seg2uxg", emailTemplateId: "template_1ay263j", emailPublicKey: "EU94wFheUNx3IA5v-", handle: "krocgranola", custServiceId: "service_qygdida", custTemplateId: "template_j5k1xg4", sheetsUrl: "https://script.google.com/macros/s/AKfycbz58hFlnL3r9GizF5O9NBMEYE6VwcVuZfKqq26g5t3qNPrDl_X1o0J3vLl5kDVU0wE2/exec" };
 const SUPA_URL="https://ownpsdvraqcnufjftjvk.supabase.co";
 const SUPA_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im93bnBzZHZyYXFjbnVmamZ0anZrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzNTM3MzksImV4cCI6MjA5MTkyOTczOX0.kjLaO6x6asikjeuDOnsfVvJmPAId0yAFyGbCmcL8GPQ";
-const ORIGIN = { lat: -23.5247, lng: -46.6916 };
+// Fallback se Supabase falhar — mesmos valores default
+const ORIGIN_FALLBACK = { lat: -23.5247, lng: -46.6916 };
+const FAIXAS_FALLBACK = [
+  { km_max: 3, valor: 5 },
+  { km_max: 5, valor: 10 },
+  { km_max: 999, valor: 15 },
+];
+// Calcula frete pela primeira faixa que cubra a distância
+function shipCostFromFaixas(km, faixas){
+  const ordenadas = [...faixas].sort((a,b)=>a.km_max-b.km_max);
+  for(const f of ordenadas){
+    if(km <= f.km_max) return +f.valor;
+  }
+  return +ordenadas[ordenadas.length-1].valor;
+}
 const products = [
   { id: "240g", name: "Kroc Tradicional 240g (Pequeno)", size: "240g", price: 44.9, img: IMG_240, desc: "Proteico \u2022 Zero a\u00e7\u00facar \u2022 Assado no forno" },
   { id: "500g", name: "Kroc Tradicional 500g (M\u00e9dio)", size: "500g", price: 84.9, img: IMG_500, desc: "Proteico \u2022 Zero a\u00e7\u00facar \u2022 Assado no forno" },
 ];
 const fmt = (v) => v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 function havKm(a1,o1,a2,o2){const R=6371,d=Math.PI/180;const x=Math.sin((a2-a1)*d/2)**2+Math.cos(a1*d)*Math.cos(a2*d)*Math.sin((o2-o1)*d/2)**2;return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));}
-function shipCost(km){return km<=3?5:km<=5?10:15;}
 const C={dark:"#3B2415",honey:"#D4941C",gold:"#E8A830",lightGold:"#F5C862",cream:"#FFF9EE",warm:"#FFFCF7",olive:"#4A6741",lOlive:"#6B8C42",brd:"#E8DDD0",mut:"#8B7355"};
 
 export default function App(){
@@ -28,6 +41,9 @@ export default function App(){
   const[ship,setShip]=useState(null);
   const[shipMsg,setShipMsg]=useState("");
   const[cepLoad,setCepLoad]=useState(false);
+  // Frete config carregada do Supabase
+  const[freteOrigin,setFreteOrigin]=useState(ORIGIN_FALLBACK);
+  const[freteFaixas,setFreteFaixas]=useState(FAIXAS_FALLBACK);
   const[ff,setFF]=useState(null);
   const[checkLink,setCheckLink]=useState("");
   const[checkErr,setCheckErr]=useState("");
@@ -40,6 +56,24 @@ export default function App(){
   const top=useRef(null);
   useEffect(()=>{setTimeout(()=>setLoaded(true),100);},[]);
   useEffect(()=>{if(top.current)top.current.scrollIntoView({behavior:"smooth"});},[step]);
+
+  // Carrega config de frete do Supabase no mount (com fallback se falhar)
+  useEffect(()=>{
+    fetch(`${SUPA_URL}/rest/v1/frete_config?select=*&id=eq.1`,{headers:{"apikey":SUPA_KEY,"Authorization":`Bearer ${SUPA_KEY}`}})
+      .then(r=>r.json())
+      .then(arr=>{
+        if(Array.isArray(arr)&&arr[0]){
+          const c=arr[0];
+          if(c.centro_lat&&c.centro_lng){
+            setFreteOrigin({lat:+c.centro_lat,lng:+c.centro_lng});
+          }
+          if(Array.isArray(c.faixas)&&c.faixas.length>0){
+            setFreteFaixas(c.faixas);
+          }
+        }
+      })
+      .catch(e=>{console.warn("[frete_config] usando fallback:",e);});
+  },[]);
   const sub=products.reduce((s,p)=>s+p.price*qty[p.id],0);
   const calcDisc=()=>{
     if(couponDisc<=0)return{prod:0,frete:0};
@@ -92,13 +126,13 @@ export default function App(){
           return fetch("https://nominatim.openstreetmap.org/search?q="+addr+"&format=json&limit=1")
             .then(function(r){return r.json();})
             .then(function(geo){
-              if(geo&&geo.length>0){var km=havKm(ORIGIN.lat,ORIGIN.lng,+geo[0].lat,+geo[0].lon);var cost=shipCost(km);setShip(cost);setShipMsg("~"+km.toFixed(1)+"km - Frete: "+fmt(cost));}
+              if(geo&&geo.length>0){var km=havKm(freteOrigin.lat,freteOrigin.lng,+geo[0].lat,+geo[0].lon);var cost=shipCostFromFaixas(km, freteFaixas);setShip(cost);setShipMsg("~"+km.toFixed(1)+"km - Frete: "+fmt(cost));}
               else{setShip(10);setShipMsg("Frete estimado: R$ 10,00");}
               setCepLoad(false);
             }).catch(function(){setShip(10);setShipMsg("Frete estimado: R$ 10,00");setCepLoad(false);});
         }).catch(function(){setCepLoad(false);setShipMsg("Preencha manualmente");setShip(10);});
     }else{setShip(null);setShipMsg("");}
-  },[]);
+  },[freteOrigin, freteFaixas]);
 
   // Normaliza nome: "JOAO silva" -> "Joao Silva". Preposições ficam minúsculas.
   var capName=function(s){
