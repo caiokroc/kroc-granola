@@ -354,22 +354,51 @@ export default function App(){
     setSending(true);setCheckErr("");
 
     // FAST-PATH: pedido gratuito (cupom 100%) pula InfinitiPay
+    // Dispara todas as mesmas notificações do fluxo pago, direto no client
     if(tot<=0){
-      // Grava pending manualmente pra admin
       try{
-        await fetch(SUPA_URL+"/rest/v1/orders",{method:"POST",headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY,"Content-Type":"application/json"},body:JSON.stringify({
-          status:"paid",
-          customer_name:capName(f.name),
-          customer_email:(f.email||"").toLowerCase().trim(),
-          customer_phone:f.phone,
-          customer_address:{street:f.street,number:f.number,complement:f.complement,neighborhood:f.neighborhood,city:f.city,state:f.state,cep:f.cep},
-          items:products.filter(function(p){return qty[p.id]>0;}).map(function(p){return{sku:p.id,name:p.name,quantity:qty[p.id],price:p.price};}),
-          qty_40:0,qty_240:qty["240g"]||0,qty_500:qty["500g"]||0,
-          subtotal:sub,frete:Math.max(0,(ship||0)-(discFrete||0)),desconto:disc,total_amount:tot,
-          cupom_code:couponCode||null,cupom_desconto_pct:couponDisc||null,
-          payment_method:"free_coupon",paid_at:new Date().toISOString(),
-        })});
-      }catch(e){console.error("[free] fail:",e);}
+        // Monta orderDetails pra emails/whatsapp (mesmo formato do fluxo pago)
+        var itemsTxt=products.filter(function(p){return qty[p.id]>0;}).map(function(p){return qty[p.id]+"× "+p.name+" ("+fmt(p.price*qty[p.id])+")";}).join("\n");
+        var dataSet={
+          name:capName(f.name),
+          phone:f.phone,
+          email:(f.email||"").toLowerCase().trim(),
+          qty240:qty["240g"]||0,
+          qty500:qty["500g"]||0,
+          frete:Math.max(0,(ship||0)-(discFrete||0)),
+          subtotal:sub,
+          total:fmt(tot),
+          totalNum:tot,
+          couponCode:couponCode||"-",
+          discountPct:couponDisc||0,
+          discountVal:disc||0,
+          street:f.street,number:f.number,complement:f.complement,
+          neighborhood:f.neighborhood,city:f.city,state:f.state,cep:f.cep,
+          orderDetails:itemsTxt,
+          date:new Date().toLocaleString("pt-BR")
+        };
+        
+        // 1. Grava pedido na tabela pedidos (fonte de verdade do admin)
+        await sendToSupabase(dataSet);
+        
+        // 2. Grava na planilha do Google Sheets (se ativo)
+        await sendToSheets(dataSet);
+        
+        // 3. Dispara emails pro dono e cliente
+        await sendEmailData(dataSet);
+        
+        // 4. Dispara WhatsApp
+        await sendWhatsApp(dataSet);
+        
+        // 5. Registra uso do cupom
+        if(couponCode&&couponCode!=="-"){try{
+          await fetch(SUPA_URL+"/rest/v1/cupons_uso",{method:"POST",headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY,"Content-Type":"application/json","Prefer":"return=minimal"},body:JSON.stringify({cupom_code:couponCode,cliente:f.name,desconto_valor:disc})});
+          var cr=await fetch(SUPA_URL+"/rest/v1/cupons?code=eq."+couponCode+"&select=uso_atual",{headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY}});
+          var cd=await cr.json();
+          if(cd&&cd[0]){await fetch(SUPA_URL+"/rest/v1/cupons?code=eq."+couponCode,{method:"PATCH",headers:{"apikey":SUPA_KEY,"Authorization":"Bearer "+SUPA_KEY,"Content-Type":"application/json","Prefer":"return=minimal"},body:JSON.stringify({uso_atual:(cd[0].uso_atual||0)+1})});}
+        }catch(e){console.warn("[free] Cupom uso:",e);}}
+      }catch(e){console.error("[free] fail:",e);setCheckErr("Erro ao processar pedido gratuito: "+e.message);setSending(false);return;}
+      
       setSending(false);
       window.location.href=window.location.origin+"/?payment=success&free=1";
       return;
